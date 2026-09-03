@@ -1138,6 +1138,16 @@ TEST_F(HotspotFdTestFixture, publish_to_onewifi_PublishFails) {
     EXPECT_EQ(0, result);
 }
 
+TEST_F(HotspotFdTestFixture, DhcpFailureDisassociationReportsClientMac) {
+    const char marker[] = "DHCP_FAILED_AND_CLIENT_DISASSOCIATED";
+    const char mac[] = "aa:bb:cc:dd:ee:ff";
+
+    EXPECT_CALL(*g_telemetryMock, t2_event_s(StrEq(marker), StrEq(mac)))
+        .WillOnce(Return(T2ERROR_SUCCESS));
+
+    EXPECT_EQ(T2ERROR_SUCCESS, t2_event_s(marker, mac));
+}
+
 // ==========================================
 // Testcases for DHCP timer state logic
 // ==========================================
