@@ -1239,7 +1239,7 @@ static int snoop_packetHandler(struct nfq_q_handle * myQueue, struct nfgenmsg *m
                 if (macaddr_with_index[0] != '\0' && publish_to_onewifi(macaddr_with_index))
                 {
                     //Added marker to track the dissociated client upon DHCP failure
-                    CcspTraceInfo(("DHCP_FAILED_AND_CLIENT_DISASSOCIATED\n"));
+                    CcspTraceInfo(("DHCP_FAILED_AND_CLIENT_DISASSOCIATED-%s\n",mac_str));
                     msg_debug("DHCP ACK not received for client MAC.Publising RBus event Timer stopped. Time elapsed: %ld s - line %d\n",
                              (elapsed_time/1000), __LINE__);
                 }
