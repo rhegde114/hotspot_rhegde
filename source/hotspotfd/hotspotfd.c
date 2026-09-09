@@ -57,6 +57,9 @@
 #include <arpa/inet.h>
 #include <linux/if.h>
 #include <netinet/icmp6.h>
+#include <net/if_arp.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 #include "ssp_global.h"
 #include "ansc_platform.h"
 #include "libHotspot.h"
@@ -93,6 +96,17 @@
 #define kDefault_KeepAliveThreshold     5
 #define kDefault_KeepAlivePolicy        2
 #define kDefault_KeepAliveCount         1
+
+#define ARP_PING_TIMEOUT_SEC    2
+#define ARP_PING_MAX_RETRIES    3
+#define ARP_REQUEST_OP          1
+#define ARP_REPLY_OP            2
+#define ARP_HARDWARE_TYPE_ETH   1
+#define ARP_PROTOCOL_TYPE_IP    0x0800
+#define ETH_HW_ADDR_LEN        6
+#define IP_ADDR_LEN             4
+#define ARP_PING_SRC_IP         "172.20.0.20"
+#define ARP_PING_TARGET_IP      "172.20.20.1"
 
 #define kDefault_PrimaryTunnelEP        "172.30.0.1" 
 #define kDefault_SecondaryTunnelEP      "172.40.0.1" 
@@ -180,6 +194,25 @@ STATIC bool gBothDnFirstSignal = true;
 STATIC bool gTunnelIsUp = false;
 STATIC bool gVapIsUp = true;
 STATIC bool wanFailover = false; //Always false as long as wan failover does'nt happen
+
+STATIC bool gIsComcastPlatform = false; // Set at startup from syscfg PlatformID
+
+/* EMA (Exponential Moving Average) for ARP ping - poor local network detection.
+ * Detects sustained packet loss (~20%+) that degrades user experience.
+ * NOT designed to trigger on WAG/CRAN hard failures (handled by keepAliveThreshold).
+ * a = 2/(N+1) where N=60 (10 min window at 10s keepalive interval).
+ *
+ * Actions:
+ *   EMA < 0.8 (20%+ loss)  → stop broadcasting SSID
+ *   EMA > 0.95 (recovered)  → resume broadcasting
+ *   Hard failure active     → skip EMA action (failover handles it)
+ */
+#define ARP_EMA_ALPHA_NUM       2       /* numerator of alpha = 2/(60+1) */
+#define ARP_EMA_ALPHA_DENOM     61      /* denominator */
+#define ARP_EMA_STOP_THRESHOLD  0.8     /* ~20% loss → stop broadcasting */
+#define ARP_EMA_RESUME_THRESHOLD 0.95   /* recovered → resume broadcasting */
+STATIC double gArpEma = 1.0;            /* start healthy */
+STATIC bool gEmaBroadcastStopped = false; /* true = SSID stopped due to poor network */
 
 STATIC char old_wan_ipv4[kMax_IPAddressLength];
 STATIC char old_wan_ipv6[kMax_IPAddressLength];
@@ -728,6 +761,209 @@ STATIC unsigned short hotspotfd_checksum(void *pdata, int len)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+/// \brief arp_ping_packet_s
+///
+///  ARP request/reply packet structure for ARP-based keepalive ping.
+///
+////////////////////////////////////////////////////////////////////////////////
+typedef struct {
+    unsigned short hw_type;
+    unsigned short proto_type;
+    unsigned char  hw_addr_len;
+    unsigned char  proto_addr_len;
+    unsigned short opcode;
+    unsigned char  sender_hw_addr[ETH_HW_ADDR_LEN];
+    unsigned char  sender_ip_addr[IP_ADDR_LEN];
+    unsigned char  target_hw_addr[ETH_HW_ADDR_LEN];
+    unsigned char  target_ip_addr[IP_ADDR_LEN];
+} __attribute__((packed)) arp_ping_packet_s;
+
+////////////////////////////////////////////////////////////////////////////////
+/// \brief hotspotfd_get_interface_mac
+///
+///  Get the MAC address of a network interface.
+///
+/// \param - ifname    - interface name (e.g. "gretap0")
+/// \param - hw_addr   - output: 6-byte MAC address
+///
+/// \return - 0 on success, -1 on failure
+///
+////////////////////////////////////////////////////////////////////////////////
+STATIC int hotspotfd_get_interface_mac(const char *ifname, unsigned char *hw_addr)
+{
+    int fd;
+    struct ifreq ifr;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        CcspTraceError(("%s: socket() failed: %s\n", __func__, strerror(errno)));
+        return -1;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    /* Get MAC address */
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        CcspTraceError(("%s: ioctl SIOCGIFHWADDR failed for %s: %s\n", __func__, ifname, strerror(errno)));
+        close(fd);
+        return -1;
+    }
+    memcpy(hw_addr, ifr.ifr_hwaddr.sa_data, ETH_HW_ADDR_LEN);
+
+    close(fd);
+    return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+/// \brief _hotspotfd_arp_ping
+///
+///  Send an ARP request to the WAG (Wireless Access Gateway) endpoint IP
+///  through the GRE tunnel interface (gretap0). The WAG is reachable at
+///  Layer 2 via the GRE tunnel, so ARP can directly verify end-to-end
+///  tunnel connectivity without ICMP.
+///
+/// \param - address   - WAG endpoint IPv4 address to ARP ping
+///
+/// \return - STATUS_SUCCESS (0) = ARP reply received from WAG
+///           STATUS_FAILURE      = no reply / error
+///
+////////////////////////////////////////////////////////////////////////////////
+STATIC int _hotspotfd_arp_ping(char *address)
+{
+    int sd = -1;
+    int status = STATUS_FAILURE;
+    int retry;
+    unsigned char src_hw[ETH_HW_ADDR_LEN];
+    struct in_addr src_in;
+    struct in_addr target_in;
+    struct sockaddr_ll sll;
+    arp_ping_packet_s arp_req;
+    arp_ping_packet_s arp_reply;
+    struct timeval tv;
+    const char *gre_ifname = GRE_IFNAME; /* gretap0 - WAG is L2 reachable here */
+    int ifindex;
+    struct ifreq ifr;
+
+    /* Convert fixed source and target IPs to network byte order */
+    if (inet_pton(AF_INET, ARP_PING_SRC_IP, &src_in) != 1) {
+        CcspTraceError(("%s: Invalid ARP_PING_SRC_IP: %s\n", __func__, ARP_PING_SRC_IP));
+        return STATUS_FAILURE;
+    }
+    if (inet_pton(AF_INET, ARP_PING_TARGET_IP, &target_in) != 1) {
+        CcspTraceError(("%s: Invalid ARP_PING_TARGET_IP: %s\n", __func__, ARP_PING_TARGET_IP));
+        return STATUS_FAILURE;
+    }
+
+    /* Get source MAC from gretap0 (no IPv4 on this interface) */
+    if (hotspotfd_get_interface_mac(gre_ifname, src_hw) != 0) {
+        CcspTraceError(("%s: Failed to get MAC for %s\n", __func__, gre_ifname));
+        return STATUS_FAILURE;
+    }
+
+    /* Create raw socket for ARP */
+    sd = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_ARP));
+    if (sd < 0) {
+        CcspTraceError(("%s: socket(AF_PACKET) failed: %s\n", __func__, strerror(errno)));
+        return STATUS_FAILURE;
+    }
+
+    /* Get interface index */
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, gre_ifname, IFNAMSIZ - 1);
+    if (ioctl(sd, SIOCGIFINDEX, &ifr) < 0) {
+        CcspTraceError(("%s: ioctl SIOCGIFINDEX failed for %s: %s\n", __func__, gre_ifname, strerror(errno)));
+        close(sd);
+        return STATUS_FAILURE;
+    }
+    ifindex = ifr.ifr_ifindex;
+
+    /* Set receive timeout */
+    tv.tv_sec = ARP_PING_TIMEOUT_SEC;
+    tv.tv_usec = 0;
+    if (setsockopt(sd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        CcspTraceError(("%s: setsockopt SO_RCVTIMEO failed: %s\n", __func__, strerror(errno)));
+        close(sd);
+        return STATUS_FAILURE;
+    }
+
+    /* Bind to the GRE tunnel interface */
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ARP);
+    sll.sll_ifindex = ifindex;
+    if (bind(sd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        CcspTraceError(("%s: bind() failed: %s\n", __func__, strerror(errno)));
+        close(sd);
+        return STATUS_FAILURE;
+    }
+
+    CcspTraceInfo(("%s: ------- ARP ping WAG %s on %s >>\n", __func__, address, gre_ifname));
+
+    for (retry = 0; retry < ARP_PING_MAX_RETRIES; retry++) {
+        /* Build ARP request */
+        memset(&arp_req, 0, sizeof(arp_req));
+        arp_req.hw_type = htons(ARP_HARDWARE_TYPE_ETH);
+        arp_req.proto_type = htons(ARP_PROTOCOL_TYPE_IP);
+        arp_req.hw_addr_len = ETH_HW_ADDR_LEN;
+        arp_req.proto_addr_len = IP_ADDR_LEN;
+        arp_req.opcode = htons(ARP_REQUEST_OP);
+        memcpy(arp_req.sender_hw_addr, src_hw, ETH_HW_ADDR_LEN);
+        memcpy(arp_req.sender_ip_addr, &src_in.s_addr, IP_ADDR_LEN);
+        /* target_hw_addr is all zeros (broadcast) for ARP request */
+        memcpy(arp_req.target_ip_addr, &target_in.s_addr, IP_ADDR_LEN);
+
+        /* Send ARP request to broadcast */
+        memset(&sll, 0, sizeof(sll));
+        sll.sll_family = AF_PACKET;
+        sll.sll_protocol = htons(ETH_P_ARP);
+        sll.sll_ifindex = ifindex;
+        sll.sll_halen = ETH_HW_ADDR_LEN;
+        memset(sll.sll_addr, 0xFF, ETH_HW_ADDR_LEN); /* broadcast */
+
+        if (sendto(sd, &arp_req, sizeof(arp_req), 0, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+            CcspTraceError(("%s: sendto ARP request failed: %s\n", __func__, strerror(errno)));
+            continue;
+        }
+
+        /* Wait for ARP reply */
+        while (1) {
+            ssize_t n = recvfrom(sd, &arp_reply, sizeof(arp_reply), 0, NULL, NULL);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* Timeout - no reply received for this attempt */
+                    CcspTraceInfo(("%s: ARP ping timeout (attempt %d/%d)\n", __func__, retry + 1, ARP_PING_MAX_RETRIES));
+                    break;
+                }
+                CcspTraceError(("%s: recvfrom error: %s\n", __func__, strerror(errno)));
+                break;
+            }
+
+            if (n < (ssize_t)sizeof(arp_ping_packet_s)) {
+                continue; /* Short packet, skip */
+            }
+
+            /* Check if this is an ARP reply from the WAG */
+            if (ntohs(arp_reply.opcode) == ARP_REPLY_OP &&
+                memcmp(arp_reply.sender_ip_addr, &target_in.s_addr, IP_ADDR_LEN) == 0) {
+                CcspTraceInfo(("%s: ARP reply received from WAG %s\n", __func__, address));
+                status = STATUS_SUCCESS;
+                break;
+            }
+        }
+
+        if (status == STATUS_SUCCESS) {
+            break;
+        }
+    }
+
+    close(sd);
+
+    CcspTraceInfo(("%s: ------- ARP ping %d << status\n", __func__, status));
+    return status;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 /// \brief hotspotfd_ping
 ///
 ///  Create message and send it. 
@@ -899,6 +1135,52 @@ STATIC int _hotspotfd_ping(char *address)
     return status;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+/// \brief hotspotfd_get_tunnel_remote
+///
+///  Query the kernel for gretap0's current remote endpoint IP.
+///  Uses 'ip -d link show gretap0' and parses the 'remote X.X.X.X' field.
+///
+/// \param - remote_ip  - buffer to store the remote IP string
+/// \param - len        - size of the buffer
+///
+/// \return - 0 on success (remote_ip filled), -1 on failure
+///
+////////////////////////////////////////////////////////////////////////////////
+STATIC int hotspotfd_get_tunnel_remote(char *remote_ip, size_t len)
+{
+    FILE *fp;
+    char line[256];
+    char *p;
+
+    remote_ip[0] = '\0';
+
+    fp = popen("ip -d link show " GRE_IFNAME " 2>/dev/null", "r");
+    if (!fp) {
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        p = strstr(line, "remote ");
+        if (p) {
+            p += 7; /* skip "remote " */
+            char *end = p;
+            while (*end && *end != ' ' && *end != '\n' && *end != '\t') {
+                end++;
+            }
+            size_t ip_len = (size_t)(end - p);
+            if (ip_len > 0 && ip_len < len) {
+                memcpy(remote_ip, p, ip_len);
+                remote_ip[ip_len] = '\0';
+            }
+            break;
+        }
+    }
+
+    pclose(fp);
+    return (remote_ip[0] != '\0') ? 0 : -1;
+}
+
 STATIC int hotspotfd_ping(char *address, bool checkClient) {
     //zqiu: do not ping WAG if no client attached, and no new client join in
     CcspTraceDebug(("%s ------------------ \n", __func__));
@@ -910,8 +1192,68 @@ STATIC int hotspotfd_ping(char *address, bool checkClient) {
 #else
     UNREFERENCED_PARAMETER(checkClient);
 #endif
-    prevPingStatus =  _hotspotfd_ping(address);
-    return  prevPingStatus;
+
+    if (gIsComcastPlatform) {
+        /* Comcast: ARP ping via gretap0 for L2 tunnel health detection.
+         * If gretap0 doesn't exist or points to wrong endpoint,
+         * fall back to ICMP to check EP reachability.
+         * State machine handles tunnel creation on SUCCESS. */
+        if (access("/sys/class/net/" GRE_IFNAME, F_OK) != 0) {
+            /* gretap0 absent - use ICMP to check if EP is reachable */
+            CcspTraceInfo(("%s: %s not available, ICMP check for %s\n",
+                           __func__, GRE_IFNAME, address));
+            prevPingStatus = _hotspotfd_ping(address);
+            return prevPingStatus;
+        }
+
+        char current_remote[kMax_IPAddressLength] = {0};
+        if (hotspotfd_get_tunnel_remote(current_remote, sizeof(current_remote)) == 0 &&
+            strcmp(current_remote, address) != 0) {
+            /* Remote mismatch - use ICMP to check if target EP is reachable */
+            CcspTraceInfo(("%s: %s remote mismatch (current=%s, target=%s), ICMP check\n",
+                           __func__, GRE_IFNAME, current_remote, address));
+            prevPingStatus = _hotspotfd_ping(address);
+            return prevPingStatus;
+        }
+
+        /* gretap0 exists and points to correct EP - use ARP */
+        CcspTraceInfo(("%s: Using ARP ping for %s\n", __func__, address));
+        int arp_result = _hotspotfd_arp_ping(address);
+        double ping_sample = (arp_result == STATUS_SUCCESS) ? 1.0 : 0.0;
+        double alpha = (double)ARP_EMA_ALPHA_NUM / ARP_EMA_ALPHA_DENOM;
+        gArpEma = alpha * ping_sample + (1.0 - alpha) * gArpEma;
+
+        CcspTraceInfo(("%s: ARP result=%d, EMA=%.4f, broadcast_stopped=%d\n",
+                       __func__, arp_result, gArpEma, gEmaBroadcastStopped));
+
+        /* EMA-based poor network detection.
+         * Only act if hard failure (keepAliveThreshold) has NOT triggered.
+         * Hard failure = gPriStateIsDown or gSecStateIsDown set by threshold logic. */
+        if (!(gPriStateIsDown && gSecStateIsDown)) {
+            if (!gEmaBroadcastStopped && gArpEma < ARP_EMA_STOP_THRESHOLD) {
+                /* ~20%+ packet loss detected - stop broadcasting SSID */
+                CcspTraceInfo(("%s: EMA=%.4f < %.2f, poor network - stopping broadcast\n",
+                               __func__, gArpEma, ARP_EMA_STOP_THRESHOLD));
+                notify_tunnel_status("Down");
+                gEmaBroadcastStopped = true;
+            } else if (gEmaBroadcastStopped && gArpEma > ARP_EMA_RESUME_THRESHOLD) {
+                /* Network recovered - resume broadcasting */
+                CcspTraceInfo(("%s: EMA=%.4f > %.2f, network recovered - resuming broadcast\n",
+                               __func__, gArpEma, ARP_EMA_RESUME_THRESHOLD));
+                notify_tunnel_status("Up");
+                gEmaBroadcastStopped = false;
+            }
+        }
+
+        /* Return the raw ARP result to the state machine.
+         * The state machine's keepAliveThreshold handles hard failover independently. */
+        prevPingStatus = arp_result;
+    } else {
+        /* Non-Comcast: ICMP endpoint ping */
+        CcspTraceInfo(("%s: Using ICMP ping for %s\n", __func__, address));
+        prevPingStatus = _hotspotfd_ping(address);
+    }
+    return prevPingStatus;
 }
 
 #if (defined (_COSA_BCM_ARM_) && !defined(_XB6_PRODUCT_REQ_)) 
@@ -2078,7 +2420,28 @@ void hotspot_start()
     char telemetry_buf[128] = {'\0'};
     if(0 == syscfg_init())
     {
-	CcspTraceInfo(("syscfg initialized\n"));
+	    CcspTraceInfo(("syscfg initialized\n"));
+
+	    /* Read PlatformID from syscfg to determine ping method */
+
+        char platformId[64] = {0};
+        if (syscfg_get(NULL, "PartnerID", platformId, sizeof(platformId)) == 0
+            && strlen(platformId) > 0) {
+             CcspTraceInfo(("DEBUG-***PlatformID is comcast, ARP ping will be used**** %s\n", platformId));
+            if (strcasecmp(platformId, "comcast") == 0) {
+                gIsComcastPlatform = true;
+                CcspTraceInfo(("PlatformID is comcast, ARP ping will be used\n"));
+            } else
+            {
+                gIsComcastPlatform = false;
+                CcspTraceInfo(("PlatformID is %s, ICMP ping will be used\n", platformId));
+            }
+        }
+        else
+        {
+            gIsComcastPlatform = false;
+            CcspTraceInfo(("PlatformID not found in syscfg, defaulting to ICMP ping\n"));
+        }
     }
 #ifdef __HAVE_SYSEVENT__
     sysevent_fd = sysevent_open("127.0.0.1", SE_SERVER_WELL_KNOWN_PORT, SE_VERSION, kHotspotfd_events, &sysevent_token);
@@ -2146,6 +2509,11 @@ void hotspot_start()
     {
         CcspTraceError(("sysevent set %s failed for %s\n", kHotspotfd_tunnelEP, kDefault_DummyEP));
     }
+
+    /* State machine: primary → secondary → both down → notifications
+     * Comcast platforms use ARP ping (L2), others use ICMP ping (L3).
+     * The ping method is selected inside hotspotfd_ping() based on gIsComcastPlatform.
+     */
     keep_it_alive:
 
     while ((gKeepAliveEnable == true) && (wanFailover == false)) {
@@ -2257,6 +2625,8 @@ Try_primary:
 					//fix ends
                     keepAliveThreshold = 0;
                     gPriStateIsDown = true;
+                    gArpEma = 1.0;
+                    gEmaBroadcastStopped = false;
 
 					CcspTraceInfo(("Primary GRE Tunnel Endpoint :%s is not alive Switching to Secondary Endpoint :%s\n", gpPrimaryEP,gpSecondaryEP));
                     memset(telemetry_buf, 0, sizeof(telemetry_buf));
@@ -2329,6 +2699,8 @@ Try_secondary:
 				if( timeElapsed > gSecondaryMaxTime ) {
 
                     gPrimaryIsActive = true;
+                    gArpEma = 1.0;
+                    gEmaBroadcastStopped = false;
 					//ARRISXB3-2770 When there is switch in tunnel , existing tunnel should be destroyed and created with new reachable tunnel as GW.
                     /* Coverity Fix CID:140439 MISSING_LOCK */
                         pthread_mutex_lock(&keep_alive_mutex);
